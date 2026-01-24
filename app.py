@@ -13,7 +13,7 @@ DISCORD_WEBHOOK = st.secrets.get("DISCORD_WEBHOOK_URL")
 LOOKBACK = 140
 MIN_SCORE = 55
 MIN_RR = 1.3
-SETUP_DISTANCE = 0.98  # 2 % sous la résistance
+SETUP_DISTANCE = 0.98  # 2 % sous résistance
 
 # =====================================================
 # LOAD TICKERS — RUSSELL 3000 (COLONNE A = Symbol)
@@ -58,10 +58,10 @@ def get_ohlc(ticker):
         return None
 
 # =====================================================
-# POLYGON — SNAPSHOT (PRIX RÉEL MARCHÉ)
+# POLYGON — PRIX MARCHÉ CORRECT (SNAPSHOT day.c)
 # =====================================================
 @st.cache_data(ttl=60)
-def get_live_price(ticker):
+def get_market_price(ticker):
     url = (
         f"https://api.polygon.io/v2/snapshot/locale/us/"
         f"markets/stocks/tickers/{ticker}?apiKey={POLYGON_KEY}"
@@ -74,16 +74,9 @@ def get_live_price(ticker):
         data = r.json()
         t = data.get("ticker", {})
 
-        # 1️⃣ Last trade réel
-        if "lastTrade" in t and "p" in t["lastTrade"]:
-            return round(t["lastTrade"]["p"], 2)
-
-        # 2️⃣ Mid quote fallback
-        if "lastQuote" in t:
-            bid = t["lastQuote"].get("bp")
-            ask = t["lastQuote"].get("ap")
-            if bid and ask:
-                return round((bid + ask) / 2, 2)
+        # ✅ PRIX UTILISÉ PAR TRADINGVIEW / BROKER
+        if "day" in t and "c" in t["day"]:
+            return round(t["day"]["c"], 2)
 
         return None
     except Exception:
@@ -188,7 +181,7 @@ def send_to_discord(df):
         )
 
     message = (
-        "📊 **Modèle 3 — Compression → Expansion (Snapshot Price)**\n\n"
+        "📊 **Modèle 3 — Compression → Expansion (PRIX MARCHÉ)**\n\n"
         + "\n".join(lines[:20])
     )
 
@@ -201,7 +194,7 @@ def send_to_discord(df):
 # =====================================================
 # UI
 # =====================================================
-st.title("📦 Modèle 3 — Compression → Expansion (PRIX SNAPSHOT)")
+st.title("📦 Modèle 3 — Compression → Expansion (PRIX POLYGON CORRECT)")
 
 limit = st.slider("Nombre de tickers à analyser", 50, len(TICKERS), 300)
 
@@ -219,13 +212,13 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
                 continue
 
             if m3["Score"] >= MIN_SCORE and m3["RR"] >= MIN_RR:
-                live_price = get_live_price(t)
-                if live_price is None:
-                    live_price = round(df["Close"].iloc[-1], 2)
+                price = get_market_price(t)
+                if price is None:
+                    price = round(df["Close"].iloc[-1], 2)
 
                 rows.append([
                     t,
-                    live_price,
+                    price,
                     m3["Status"],
                     m3["Score"],
                     m3["Entry"],
