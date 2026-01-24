@@ -13,10 +13,10 @@ DISCORD_WEBHOOK = st.secrets.get("DISCORD_WEBHOOK_URL")
 LOOKBACK = 140
 MIN_SCORE = 55
 MIN_RR = 1.3
-SETUP_DISTANCE = 0.98   # 2 % sous résistance
+SETUP_DISTANCE = 0.98  # 2 % sous la résistance
 
 # =====================================================
-# LOAD TICKERS — RUSSELL 3000 (COLONNE A)
+# LOAD TICKERS — RUSSELL 3000 (COLONNE A = Symbol)
 # =====================================================
 @st.cache_data
 def load_tickers():
@@ -35,7 +35,7 @@ def load_tickers():
 TICKERS = load_tickers()
 
 # =====================================================
-# POLYGON OHLC — ROBUSTE
+# POLYGON — OHLC DAILY (STRUCTURE)
 # =====================================================
 @st.cache_data(ttl=3600)
 def get_ohlc(ticker):
@@ -54,6 +54,21 @@ def get_ohlc(ticker):
         df = pd.DataFrame(data["results"])
         df["Close"] = df["c"]
         return df
+    except Exception:
+        return None
+
+# =====================================================
+# POLYGON — LAST TRADE (PRIX RÉEL)
+# =====================================================
+@st.cache_data(ttl=60)
+def get_last_price(ticker):
+    url = f"https://api.polygon.io/v2/last/trade/{ticker}?apiKey={POLYGON_KEY}"
+    try:
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return round(data["results"]["p"], 2)
     except Exception:
         return None
 
@@ -118,8 +133,8 @@ def model3_setup(df):
 
     score_norm = round(score / 11 * 100, 2)
 
-    entry = round(c.iloc[i], 2)
     atr = atr14.iloc[i]
+    entry = round(c.iloc[i], 2)
 
     sl = round(range_low - 0.2 * atr, 2)
     tp1 = round(entry + 2 * atr, 2)
@@ -141,7 +156,7 @@ def model3_setup(df):
     }
 
 # =====================================================
-# DISCORD WEBHOOK
+# DISCORD
 # =====================================================
 def send_to_discord(df):
     if not DISCORD_WEBHOOK or df.empty:
@@ -151,8 +166,7 @@ def send_to_discord(df):
     for _, r in df.iterrows():
         lines.append(
             f"{r['Status']} **{r['Ticker']}** @ ${r['Price']} | "
-            f"Score `{r['Score']}` | "
-            f"R:R `{r['R:R']}` | "
+            f"Score `{r['Score']}` | R:R `{r['R:R']}` | "
             f"SL `{r['SL']}` → TP `{r['TP1']}`"
         )
 
@@ -162,7 +176,6 @@ def send_to_discord(df):
     )
 
     payload = {"content": message[:1900]}
-
     try:
         requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
     except Exception:
@@ -185,16 +198,17 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
                 continue
 
             m3 = model3_setup(df)
+            if not m3 or m3["RR"] is None:
+                continue
 
-            if (
-                m3
-                and m3["Score"] >= MIN_SCORE
-                and m3["RR"] is not None
-                and m3["RR"] >= MIN_RR
-            ):
+            if m3["Score"] >= MIN_SCORE and m3["RR"] >= MIN_RR:
+                last_price = get_last_price(t)
+                if last_price is None:
+                    last_price = round(df["Close"].iloc[-1], 2)
+
                 rows.append([
                     t,
-                    round(df["Close"].iloc[-1], 2),
+                    last_price,
                     m3["Status"],
                     m3["Score"],
                     m3["Entry"],
@@ -219,7 +233,7 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
 
         st.dataframe(result, width="stretch")
         send_to_discord(result)
-
         st.success("Scan terminé et envoyé sur Discord ✅")
     else:
         st.info("Aucun setup détecté avec les critères actuels.")
+
