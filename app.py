@@ -10,6 +10,9 @@ st.set_page_config(layout="wide")
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 LOOKBACK = 140
 
+MIN_SCORE = 60
+MIN_RR = 1.5
+
 # =====================================================
 # LOAD TICKERS — RUSSELL 3000 (COLONNE A)
 # =====================================================
@@ -44,6 +47,7 @@ def get_ohlc(ticker):
 
     try:
         r = requests.get(url, timeout=10)
+
         if r.status_code != 200:
             return None
         if not r.text or r.text[0] != "{":
@@ -75,7 +79,7 @@ def ATR(df, n=14):
     return tr.rolling(n).mean()
 
 # =====================================================
-# MODÈLE 3 — COMPRESSION → EXPANSION
+# MODÈLE 3 — COMPRESSION → EXPANSION (ASSOUPLI)
 # =====================================================
 def model3_volatility_expansion(df):
     if len(df) < 60:
@@ -103,9 +107,9 @@ def model3_volatility_expansion(df):
     i = -1
     score = 0
 
-    # ---- Compression ----
+    # ---- Compression (plus tolérante) ----
     score += atr14.iloc[i] < atr40.iloc[i]
-    score += atr14.iloc[i] < atr14.iloc[i-10]
+    score += atr14.iloc[i] <= atr14.iloc[i-10] * 1.05
     score += range_10.iloc[i] < median_range.iloc[i]
     score += bb_width.iloc[i] < bb_width.rolling(40).median().iloc[i]
     score += v.iloc[i] < vol_mean.iloc[i]
@@ -114,7 +118,7 @@ def model3_volatility_expansion(df):
     breakout = c.iloc[i] > h.rolling(10).max().iloc[i-1]
     score += breakout * 2
     score += ((h.iloc[i] - l.iloc[i]) > 1.5 * atr14.iloc[i]) * 2
-    score += (v.iloc[i] > 1.5 * vol_mean.iloc[i]) * 2
+    score += (v.iloc[i] > 1.3 * vol_mean.iloc[i]) * 2
 
     # ---- Trend filter ----
     score += c.iloc[i] > ema20.iloc[i]
@@ -124,13 +128,12 @@ def model3_volatility_expansion(df):
 
     if not breakout:
         return {
-            "Score M3": score_norm,
+            "Score": score_norm,
             "Entry": None,
             "SL": None,
             "TP1": None,
             "TP2": None,
-            "RR TP1": None,
-            "RR TP2": None
+            "RR": None
         }
 
     entry = round(c.iloc[i], 2)
@@ -144,29 +147,31 @@ def model3_volatility_expansion(df):
     tp1 = round(entry + 2 * atr, 2)
     tp2 = round(entry + 3 * atr, 2)
 
-    # ---- Risk / Reward ----
     risk = entry - sl
-    rr_tp1 = round((tp1 - entry) / risk, 2) if risk > 0 else None
-    rr_tp2 = round((tp2 - entry) / risk, 2) if risk > 0 else None
+    rr = round((tp1 - entry) / risk, 2) if risk > 0 else None
 
     return {
-        "Score M3": score_norm,
+        "Score": score_norm,
         "Entry": entry,
         "SL": sl,
         "TP1": tp1,
         "TP2": tp2,
-        "RR TP1": rr_tp1,
-        "RR TP2": rr_tp2
+        "RR": rr
     }
 
 # =====================================================
 # UI
 # =====================================================
-st.title("📦 Modèle 3 — Compression → Expansion (Risk / Reward)")
+st.title("📦 Modèle 3 — Compression → Expansion (Swing Trading)")
 
-limit = st.slider("Nombre de tickers à analyser", 50, len(TICKERS), 200)
+limit = st.slider(
+    "Nombre de tickers à analyser",
+    min_value=50,
+    max_value=len(TICKERS),
+    value=300
+)
 
-if st.button("🔍 Scanner Modèle 3"):
+if st.button("🔍 Scanner le Modèle 3"):
     rows = []
 
     with st.spinner("Scan en cours…"):
@@ -176,32 +181,36 @@ if st.button("🔍 Scanner Modèle 3"):
                 continue
 
             m3 = model3_volatility_expansion(df)
-            if m3 and m3["Score M3"] >= 70 and m3["RR TP1"] and m3["RR TP1"] >= 2:
+
+            if (
+                m3
+                and m3["Score"] >= MIN_SCORE
+                and m3["RR"] is not None
+                and m3["RR"] >= MIN_RR
+            ):
                 rows.append([
                     t,
                     round(df["Close"].iloc[-1], 2),
-                    m3["Score M3"],
+                    m3["Score"],
                     m3["Entry"],
                     m3["SL"],
                     m3["TP1"],
                     m3["TP2"],
-                    m3["RR TP1"],
-                    m3["RR TP2"]
+                    m3["RR"]
                 ])
 
     if rows:
         result = pd.DataFrame(rows, columns=[
             "Ticker",
             "Price",
-            "Score M3",
+            "Score",
             "Entry",
             "SL",
             "TP1",
             "TP2",
-            "R:R TP1",
-            "R:R TP2"
-        ]).sort_values("Score M3", ascending=False)
+            "R:R"
+        ]).sort_values("Score", ascending=False)
 
         st.dataframe(result, width="stretch")
     else:
-        st.info("Aucun setup Modèle 3 valide (Score ≥ 70 et R:R ≥ 2).")
+        st.info("Aucun setup valide avec les critères actuels.")
