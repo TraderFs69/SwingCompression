@@ -8,11 +8,12 @@ import requests
 st.set_page_config(layout="wide")
 
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
+DISCORD_WEBHOOK = st.secrets.get("DISCORD_WEBHOOK_URL")
 
 LOOKBACK = 140
-MIN_SCORE = 55       # setup réaliste
-MIN_RR = 1.3         # swing B+ et +
-SETUP_DISTANCE = 0.98  # 2 % sous la résistance
+MIN_SCORE = 55
+MIN_RR = 1.3
+SETUP_DISTANCE = 0.98   # 2 % sous résistance
 
 # =====================================================
 # LOAD TICKERS — RUSSELL 3000 (COLONNE A)
@@ -20,7 +21,6 @@ SETUP_DISTANCE = 0.98  # 2 % sous la résistance
 @st.cache_data
 def load_tickers():
     df = pd.read_excel("russell3000_constituents.xlsx", header=0)
-
     tickers = (
         df.iloc[:, 0]
         .dropna()
@@ -30,7 +30,6 @@ def load_tickers():
         .unique()
         .tolist()
     )
-
     return [t for t in tickers if t != "SYMBOL"]
 
 TICKERS = load_tickers()
@@ -45,24 +44,16 @@ def get_ohlc(ticker):
         f"{LOOKBACK}/2025-01-01"
         f"?adjusted=true&sort=asc&apiKey={POLYGON_KEY}"
     )
-
     try:
         r = requests.get(url, timeout=10)
-
-        if r.status_code != 200:
+        if r.status_code != 200 or not r.text or r.text[0] != "{":
             return None
-        if not r.text or r.text[0] != "{":
-            return None
-
         data = r.json()
         if "results" not in data or not data["results"]:
             return None
-
         df = pd.DataFrame(data["results"])
         df["Close"] = df["c"]
-
         return df
-
     except Exception:
         return None
 
@@ -81,7 +72,7 @@ def ATR(df, n=14):
     return tr.rolling(n).mean()
 
 # =====================================================
-# MODÈLE 3 — COMPRESSION → EXPANSION (SETUP MODE)
+# MODÈLE 3 — COMPRESSION → EXPANSION (SETUP / TRIGGER)
 # =====================================================
 def model3_setup(df):
     if len(df) < 60:
@@ -96,14 +87,12 @@ def model3_setup(df):
     ema20 = EMA(c, 20)
     ema50 = EMA(c, 50)
 
-    # Bollinger width
     bb_mid = c.rolling(20).mean()
     bb_std = c.rolling(20).std()
     bb_width = (bb_std * 4) / bb_mid
 
     range_high = h.rolling(10).max().iloc[-2]
     range_low = l.rolling(10).min().iloc[-2]
-    range_10 = range_high - range_low
     median_range = (h.rolling(10).max() - l.rolling(10).min()).rolling(40).median()
 
     vol_mean = v.rolling(20).mean()
@@ -111,25 +100,24 @@ def model3_setup(df):
     i = -1
     score = 0
 
-    # ---- COMPRESSION ----
+    # Compression
     score += atr14.iloc[i] < atr40.iloc[i]
     score += atr14.iloc[i] <= atr14.iloc[i-10] * 1.05
-    score += range_10 < median_range.iloc[i]
+    score += (range_high - range_low) < median_range.iloc[i]
     score += bb_width.iloc[i] < bb_width.rolling(40).median().iloc[i]
     score += v.iloc[i] < vol_mean.iloc[i]
 
-    # ---- PROXIMITÉ BREAKOUT ----
+    # Proximité breakout
     near_breakout = c.iloc[i] >= range_high * SETUP_DISTANCE
     if near_breakout:
         score += 2
 
-    # ---- STRUCTURE ----
+    # Structure
     score += c.iloc[i] > ema20.iloc[i]
     score += c.iloc[i] > ema50.iloc[i]
 
     score_norm = round(score / 11 * 100, 2)
 
-    # ---- TRADE LEVELS (SETUP) ----
     entry = round(c.iloc[i], 2)
     atr = atr14.iloc[i]
 
@@ -140,11 +128,11 @@ def model3_setup(df):
     risk = entry - sl
     rr = round((tp1 - entry) / risk, 2) if risk > 0 else None
 
-    status = "TRIGGER" if c.iloc[i] > range_high else "SETUP"
+    status = "🚀 TRIGGER" if c.iloc[i] > range_high else "🟡 SETUP"
 
     return {
-        "Score": score_norm,
         "Status": status,
+        "Score": score_norm,
         "Entry": entry,
         "SL": sl,
         "TP1": tp1,
@@ -153,18 +141,41 @@ def model3_setup(df):
     }
 
 # =====================================================
+# DISCORD WEBHOOK
+# =====================================================
+def send_to_discord(df):
+    if not DISCORD_WEBHOOK or df.empty:
+        return
+
+    lines = []
+    for _, r in df.iterrows():
+        lines.append(
+            f"{r['Status']} **{r['Ticker']}** @ ${r['Price']} | "
+            f"Score `{r['Score']}` | "
+            f"R:R `{r['R:R']}` | "
+            f"SL `{r['SL']}` → TP `{r['TP1']}`"
+        )
+
+    message = (
+        "📊 **Modèle 3 — Compression → Expansion**\n\n"
+        + "\n".join(lines[:20])
+    )
+
+    payload = {"content": message[:1900]}
+
+    try:
+        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+    except Exception:
+        pass
+
+# =====================================================
 # UI
 # =====================================================
 st.title("📦 Modèle 3 — Compression → Expansion (SETUP / TRIGGER)")
 
-limit = st.slider(
-    "Nombre de tickers à analyser",
-    min_value=50,
-    max_value=len(TICKERS),
-    value=300
-)
+limit = st.slider("Nombre de tickers à analyser", 50, len(TICKERS), 300)
 
-if st.button("🔍 Scanner Modèle 3"):
+if st.button("🚀 Scanner et envoyer sur Discord"):
     rows = []
 
     with st.spinner("Scan en cours…"):
@@ -207,5 +218,8 @@ if st.button("🔍 Scanner Modèle 3"):
         ]).sort_values(["Status", "Score"], ascending=[True, False])
 
         st.dataframe(result, width="stretch")
+        send_to_discord(result)
+
+        st.success("Scan terminé et envoyé sur Discord ✅")
     else:
         st.info("Aucun setup détecté avec les critères actuels.")
