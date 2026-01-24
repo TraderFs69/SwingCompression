@@ -70,14 +70,10 @@ def get_market_price(ticker):
         r = requests.get(url, timeout=5)
         if r.status_code != 200:
             return None
-
         data = r.json()
         t = data.get("ticker", {})
-
-        # ✅ PRIX UTILISÉ PAR TRADINGVIEW / BROKER
         if "day" in t and "c" in t["day"]:
             return round(t["day"]["c"], 2)
-
         return None
     except Exception:
         return None
@@ -97,7 +93,7 @@ def ATR(df, n=14):
     return tr.rolling(n).mean()
 
 # =====================================================
-# MODÈLE 3 — COMPRESSION → EXPANSION (SETUP / TRIGGER)
+# MODÈLE 3 — SETUP (DISTANCES, PAS DE PRIX ABSOLUS)
 # =====================================================
 def model3_setup(df):
     if len(df) < 60:
@@ -133,8 +129,7 @@ def model3_setup(df):
     score += v.iloc[i] < vol_mean.iloc[i]
 
     # Proximité breakout
-    near_breakout = c.iloc[i] >= range_high * SETUP_DISTANCE
-    if near_breakout:
+    if c.iloc[i] >= range_high * SETUP_DISTANCE:
         score += 2
 
     # Structure
@@ -143,26 +138,14 @@ def model3_setup(df):
 
     score_norm = round(score / 11 * 100, 2)
 
-    atr = atr14.iloc[i]
-    entry = round(c.iloc[i], 2)
-
-    sl = round(range_low - 0.2 * atr, 2)
-    tp1 = round(entry + 2 * atr, 2)
-    tp2 = round(entry + 3 * atr, 2)
-
-    risk = entry - sl
-    rr = round((tp1 - entry) / risk, 2) if risk > 0 else None
-
     status = "🚀 TRIGGER" if c.iloc[i] > range_high else "🟡 SETUP"
 
     return {
         "Status": status,
         "Score": score_norm,
-        "Entry": entry,
-        "SL": sl,
-        "TP1": tp1,
-        "TP2": tp2,
-        "RR": rr
+        "ATR": atr14.iloc[i],
+        "RangeLow": range_low,
+        "DailyClose": c.iloc[i]
     }
 
 # =====================================================
@@ -176,12 +159,13 @@ def send_to_discord(df):
     for _, r in df.iterrows():
         lines.append(
             f"{r['Status']} **{r['Ticker']}** @ ${r['Price']} | "
-            f"Score `{r['Score']}` | R:R `{r['R:R']}` | "
+            f"Score `{r['Score']}` | "
+            f"R:R `{r['R:R']}` | "
             f"SL `{r['SL']}` → TP `{r['TP1']}`"
         )
 
     message = (
-        "📊 **Modèle 3 — Compression → Expansion (PRIX MARCHÉ)**\n\n"
+        "📊 **Modèle 3 — Compression → Expansion (TP/SL alignés prix marché)**\n\n"
         + "\n".join(lines[:20])
     )
 
@@ -194,7 +178,7 @@ def send_to_discord(df):
 # =====================================================
 # UI
 # =====================================================
-st.title("📦 Modèle 3 — Compression → Expansion (PRIX POLYGON CORRECT)")
+st.title("📦 Modèle 3 — TP / SL alignés sur le prix marché")
 
 limit = st.slider("Nombre de tickers à analyser", 50, len(TICKERS), 300)
 
@@ -208,25 +192,39 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
                 continue
 
             m3 = model3_setup(df)
-            if not m3 or m3["RR"] is None:
+            if not m3 or m3["Score"] < MIN_SCORE:
                 continue
 
-            if m3["Score"] >= MIN_SCORE and m3["RR"] >= MIN_RR:
-                price = get_market_price(t)
-                if price is None:
-                    price = round(df["Close"].iloc[-1], 2)
+            price = get_market_price(t)
+            if price is None:
+                price = round(m3["DailyClose"], 2)
 
-                rows.append([
-                    t,
-                    price,
-                    m3["Status"],
-                    m3["Score"],
-                    m3["Entry"],
-                    m3["SL"],
-                    m3["TP1"],
-                    m3["TP2"],
-                    m3["RR"]
-                ])
+            atr = m3["ATR"]
+
+            # SL recalé sous la base + ajustement prix
+            sl = round(m3["RangeLow"] - 0.2 * atr + (price - m3["DailyClose"]), 2)
+
+            # TP dynamiques depuis le prix marché
+            tp1 = round(price + 2 * atr, 2)
+            tp2 = round(price + 3 * atr, 2)
+
+            risk = price - sl
+            rr = round((tp1 - price) / risk, 2) if risk > 0 else None
+
+            if rr is None or rr < MIN_RR:
+                continue
+
+            rows.append([
+                t,
+                price,
+                m3["Status"],
+                m3["Score"],
+                price,
+                sl,
+                tp1,
+                tp2,
+                rr
+            ])
 
     if rows:
         result = pd.DataFrame(rows, columns=[
@@ -245,4 +243,4 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
         send_to_discord(result)
         st.success("Scan terminé et envoyé sur Discord ✅")
     else:
-        st.info("Aucun setup détecté avec les critères actuels.")
+        st.info("Aucun setup valide avec les critères actuels.")
