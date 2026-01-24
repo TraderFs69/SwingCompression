@@ -27,7 +27,7 @@ def load_tickers():
         .tolist()
     )
 
-    return [t for t for t in tickers if t != "SYMBOL"]
+    return [t for t in tickers if t != "SYMBOL"]
 
 TICKERS = load_tickers()
 
