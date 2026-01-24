@@ -58,17 +58,34 @@ def get_ohlc(ticker):
         return None
 
 # =====================================================
-# POLYGON — LAST TRADE (PRIX RÉEL)
+# POLYGON — SNAPSHOT (PRIX RÉEL MARCHÉ)
 # =====================================================
 @st.cache_data(ttl=60)
-def get_last_price(ticker):
-    url = f"https://api.polygon.io/v2/last/trade/{ticker}?apiKey={POLYGON_KEY}"
+def get_live_price(ticker):
+    url = (
+        f"https://api.polygon.io/v2/snapshot/locale/us/"
+        f"markets/stocks/tickers/{ticker}?apiKey={POLYGON_KEY}"
+    )
     try:
         r = requests.get(url, timeout=5)
         if r.status_code != 200:
             return None
+
         data = r.json()
-        return round(data["results"]["p"], 2)
+        t = data.get("ticker", {})
+
+        # 1️⃣ Last trade réel
+        if "lastTrade" in t and "p" in t["lastTrade"]:
+            return round(t["lastTrade"]["p"], 2)
+
+        # 2️⃣ Mid quote fallback
+        if "lastQuote" in t:
+            bid = t["lastQuote"].get("bp")
+            ask = t["lastQuote"].get("ap")
+            if bid and ask:
+                return round((bid + ask) / 2, 2)
+
+        return None
     except Exception:
         return None
 
@@ -171,7 +188,7 @@ def send_to_discord(df):
         )
 
     message = (
-        "📊 **Modèle 3 — Compression → Expansion**\n\n"
+        "📊 **Modèle 3 — Compression → Expansion (Snapshot Price)**\n\n"
         + "\n".join(lines[:20])
     )
 
@@ -184,7 +201,7 @@ def send_to_discord(df):
 # =====================================================
 # UI
 # =====================================================
-st.title("📦 Modèle 3 — Compression → Expansion (SETUP / TRIGGER)")
+st.title("📦 Modèle 3 — Compression → Expansion (PRIX SNAPSHOT)")
 
 limit = st.slider("Nombre de tickers à analyser", 50, len(TICKERS), 300)
 
@@ -202,13 +219,13 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
                 continue
 
             if m3["Score"] >= MIN_SCORE and m3["RR"] >= MIN_RR:
-                last_price = get_last_price(t)
-                if last_price is None:
-                    last_price = round(df["Close"].iloc[-1], 2)
+                live_price = get_live_price(t)
+                if live_price is None:
+                    live_price = round(df["Close"].iloc[-1], 2)
 
                 rows.append([
                     t,
-                    last_price,
+                    live_price,
                     m3["Status"],
                     m3["Score"],
                     m3["Entry"],
@@ -236,4 +253,3 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
         st.success("Scan terminé et envoyé sur Discord ✅")
     else:
         st.info("Aucun setup détecté avec les critères actuels.")
-
