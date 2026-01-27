@@ -12,21 +12,21 @@ POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 DISCORD_WEBHOOK = st.secrets.get("DISCORD_WEBHOOK_URL")
 
 LOOKBACK = 160
-MIN_SCORE = 55
-MIN_RR = 1.3
-SETUP_DISTANCE = 0.98  # 2 % sous résistance
+MIN_SCORE_STRICT = 65
+MIN_SCORE_WATCH = 70
+MIN_RR_STRICT = 1.5
+MIN_RR_WATCH = 1.2
 
 # =====================================================
 # LOAD TICKERS — RUSSELL 3000
 # =====================================================
 @st.cache_data
 def load_tickers():
-    df = pd.read_excel("russell3000_constituents.xlsx", header=0)
+    df = pd.read_excel("russell3000_constituents.xlsx")
     tickers = (
         df.iloc[:, 0]
         .dropna()
         .astype(str)
-        .str.strip()
         .str.upper()
         .unique()
         .tolist()
@@ -36,7 +36,7 @@ def load_tickers():
 TICKERS = load_tickers()
 
 # =====================================================
-# POLYGON — OHLC DAILY (DATES DYNAMIQUES)
+# POLYGON — OHLC DAILY
 # =====================================================
 @st.cache_data(ttl=3600)
 def get_ohlc(ticker):
@@ -45,19 +45,16 @@ def get_ohlc(ticker):
 
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/"
-        f"{start}/{end}"
-        f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
+        f"{start}/{end}?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
     )
 
     try:
         r = requests.get(url, timeout=10)
         if r.status_code != 200:
             return None
-
         data = r.json()
-        if "results" not in data or not data["results"]:
+        if "results" not in data:
             return None
-
         df = pd.DataFrame(data["results"])
         df["Close"] = df["c"]
         return df
@@ -65,34 +62,35 @@ def get_ohlc(ticker):
         return None
 
 # =====================================================
-# PRIX MARCHÉ (SNAPSHOT)
+# EARNINGS FLAG (Polygon)
 # =====================================================
-@st.cache_data(ttl=60)
-def get_market_price(ticker):
+@st.cache_data(ttl=86400)
+def has_earnings_near(ticker, window=1):
+    today = date.today()
+    start = today - timedelta(days=window)
+    end = today + timedelta(days=window)
+
     url = (
-        f"https://api.polygon.io/v2/snapshot/locale/us/"
-        f"markets/stocks/tickers/{ticker}?apiKey={POLYGON_KEY}"
+        f"https://api.polygon.io/v3/reference/earnings?"
+        f"ticker={ticker}&from={start}&to={end}&apiKey={POLYGON_KEY}"
     )
+
     try:
         r = requests.get(url, timeout=5)
         if r.status_code != 200:
-            return None
-
+            return False
         data = r.json()
-        t = data.get("ticker", {})
-        if "day" in t and "c" in t["day"]:
-            return round(t["day"]["c"], 2)
-        return None
+        return bool(data.get("results"))
     except Exception:
-        return None
+        return False
 
 # =====================================================
-# INDICATEURS
+# INDICATORS
 # =====================================================
 def EMA(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
-def ATR(df, n=14):
+def ATR(df, n):
     tr = pd.concat([
         df["h"] - df["l"],
         (df["h"] - df["Close"].shift()).abs(),
@@ -101,95 +99,77 @@ def ATR(df, n=14):
     return tr.rolling(n).mean()
 
 # =====================================================
-# MODÈLE 3 — NOUVEAU TRIGGER UNIQUEMENT
+# MODEL 3 — STRICT / WATCH
 # =====================================================
-def model3_setup(df):
+def model3(df):
     if len(df) < 70:
         return None
 
-    def compute(i):
-        c = df["Close"]
-        h, l, v = df["h"], df["l"], df["v"]
+    c = df["Close"]
+    h, l, v = df["h"], df["l"], df["v"]
 
-        atr14 = ATR(df, 14)
-        atr40 = ATR(df, 40)
+    atr14 = ATR(df, 14)
+    atr40 = ATR(df, 40)
+    ema20 = EMA(c, 20)
+    ema50 = EMA(c, 50)
 
-        ema20 = EMA(c, 20)
-        ema50 = EMA(c, 50)
+    bb_mid = c.rolling(20).mean()
+    bb_std = c.rolling(20).std()
+    bb_width = (bb_std * 4) / bb_mid
 
-        bb_mid = c.rolling(20).mean()
-        bb_std = c.rolling(20).std()
-        bb_width = (bb_std * 4) / bb_mid
+    range_high = h.rolling(10).max()
+    range_low = l.rolling(10).min()
+    median_range = (range_high - range_low).rolling(40).median()
 
-        range_high = h.rolling(10).max().iloc[i-1]
-        range_low = l.rolling(10).min().iloc[i-1]
-        median_range = (h.rolling(10).max() - l.rolling(10).min()).rolling(40).median()
+    vol_mean = v.rolling(20).mean()
 
-        vol_mean = v.rolling(20).mean()
+    i = -1
+    score = 0
+    score += atr14.iloc[i] < atr40.iloc[i]
+    score += atr14.iloc[i] <= atr14.iloc[i-10] * 1.05
+    score += (range_high.iloc[i-1] - range_low.iloc[i-1]) < median_range.iloc[i]
+    score += bb_width.iloc[i] < bb_width.rolling(40).median().iloc[i]
+    score += v.iloc[i] < vol_mean.iloc[i]
+    score += c.iloc[i] > ema20.iloc[i]
+    score += c.iloc[i] > ema50.iloc[i]
 
-        score = 0
-        score += atr14.iloc[i] < atr40.iloc[i]
-        score += atr14.iloc[i] <= atr14.iloc[i-10] * 1.05
-        score += (range_high - range_low) < median_range.iloc[i]
-        score += bb_width.iloc[i] < bb_width.rolling(40).median().iloc[i]
-        score += v.iloc[i] < vol_mean.iloc[i]
+    score_norm = round(score / 7 * 100, 2)
 
-        score += c.iloc[i] > ema20.iloc[i]
-        score += c.iloc[i] > ema50.iloc[i]
+    status = "🚀 TRIGGER" if c.iloc[i] > range_high.iloc[i-1] else "🟡 SETUP"
 
-        status = "🚀 TRIGGER" if c.iloc[i] > range_high else "🟡 SETUP"
-        score_norm = round(score / 11 * 100, 2)
-
-        return status, score_norm, atr14.iloc[i], range_low, c.iloc[i]
-
-    status_y, score_y, *_ = compute(-2)
-    status_t, score_t, atr, range_low, close = compute(-1)
-
-    if status_t == "🚀 TRIGGER" and status_y != "🚀 TRIGGER" and score_t >= MIN_SCORE:
-        return {
-            "Status": status_t,
-            "Score": score_t,
-            "ATR": atr,
-            "RangeLow": range_low,
-            "DailyClose": close
-        }
-
-    return None
-
-# =====================================================
-# DISCORD — TRIGGERS SEULEMENT
-# =====================================================
-def send_to_discord(df):
-    if not DISCORD_WEBHOOK or df.empty:
-        return
-
-    lines = []
-    for _, r in df.iterrows():
-        lines.append(
-            f"🚀 **{r['Ticker']}** @ ${r['Price']} | "
-            f"Score `{r['Score']}` | "
-            f"R:R `{r['R:R']}` | "
-            f"SL `{r['SL']}` → TP `{r['TP1']}`"
-        )
-
-    payload = {
-        "content": "🚨 **NOUVEAUX TRIGGERS — Modèle 3**\n\n" + "\n".join(lines[:20])
+    return {
+        "Status": status,
+        "Score": score_norm,
+        "ATR": atr14.iloc[i],
+        "RangeLow": range_low.iloc[i],
+        "Close": c.iloc[i]
     }
 
-    try:
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
-    except Exception:
-        pass
+# =====================================================
+# DISCORD
+# =====================================================
+def send_to_discord(title, rows):
+    if not DISCORD_WEBHOOK or not rows:
+        return
+
+    msg = f"**{title}**\n\n"
+    for r in rows[:20]:
+        msg += (
+            f"{r['Tag']} **{r['Ticker']}** @ ${r['Price']} | "
+            f"Score `{r['Score']}` | R:R `{r['RR']}`\n"
+        )
+
+    requests.post(DISCORD_WEBHOOK, json={"content": msg})
 
 # =====================================================
 # UI
 # =====================================================
-st.title("🚨 Modèle 3 — Discord = nouveaux triggers uniquement")
+st.title("🚨 Modèle 3 — STRICT & WATCHLIST (Earnings-Aware)")
 
-limit = st.slider("Nombre de tickers à analyser", 50, len(TICKERS), 300)
+limit = st.slider("Nombre de tickers", 50, len(TICKERS), 300)
 
-if st.button("🚀 Scanner et envoyer sur Discord"):
-    rows = []
+if st.button("🚀 Scanner"):
+    strict, watch = [], []
 
     with st.spinner("Scan en cours…"):
         for t in TICKERS[:limit]:
@@ -197,37 +177,55 @@ if st.button("🚀 Scanner et envoyer sur Discord"):
             if df is None:
                 continue
 
-            m3 = model3_setup(df)
-            if not m3:
+            m = model3(df)
+            if not m:
                 continue
 
-            price = get_market_price(t)
-            if price is None:
-                price = round(m3["DailyClose"], 2)
+            earnings = has_earnings_near(t)
+            price = round(m["Close"], 2)
+            atr = m["ATR"]
+            sl = round(m["RangeLow"] - 0.2 * atr, 2)
+            tp = round(price + 2 * atr, 2)
+            rr = round((tp - price) / (price - sl), 2) if price > sl else 0
 
-            atr = m3["ATR"]
-            sl = round(m3["RangeLow"] - 0.2 * atr + (price - m3["DailyClose"]), 2)
+            # STRICT
+            if (
+                m["Status"] == "🚀 TRIGGER"
+                and m["Score"] >= MIN_SCORE_STRICT
+                and rr >= MIN_RR_STRICT
+                and not earnings
+            ):
+                strict.append({
+                    "Ticker": t,
+                    "Price": price,
+                    "Score": m["Score"],
+                    "RR": rr,
+                    "Tag": "🚨"
+                })
 
-            tp1 = round(price + 2 * atr, 2)
-            tp2 = round(price + 3 * atr, 2)
+            # WATCH
+            elif (
+                m["Status"] == "🟡 SETUP"
+                and m["Score"] >= MIN_SCORE_WATCH
+                and rr >= MIN_RR_WATCH
+            ):
+                watch.append({
+                    "Ticker": t,
+                    "Price": price,
+                    "Score": m["Score"],
+                    "RR": rr,
+                    "Tag": "⚠️ Earnings" if earnings else "🟡"
+                })
 
-            risk = price - sl
-            rr = round((tp1 - price) / risk, 2) if risk > 0 else None
+    if strict:
+        st.subheader("🚨 STRICT TRIGGERS")
+        st.dataframe(pd.DataFrame(strict))
+        send_to_discord("🚨 STRICT TRIGGERS", strict)
 
-            if rr is None or rr < MIN_RR:
-                continue
+    if watch:
+        st.subheader("🟡 WATCHLIST")
+        st.dataframe(pd.DataFrame(watch))
+        send_to_discord("🟡 WATCHLIST", watch)
 
-            rows.append([
-                t, price, m3["Score"], sl, tp1, tp2, rr
-            ])
-
-    if rows:
-        result = pd.DataFrame(rows, columns=[
-            "Ticker", "Price", "Score", "SL", "TP1", "TP2", "R:R"
-        ]).sort_values("Score", ascending=False)
-
-        st.dataframe(result, use_container_width=True)
-        send_to_discord(result)
-        st.success("🚀 Nouveaux triggers envoyés sur Discord")
-    else:
-        st.info("Aucun nouveau trigger aujourd’hui.")
+    if not strict and not watch:
+        st.info("Aucun signal aujourd’hui.")
