@@ -1,5 +1,5 @@
 # =====================================================
-# MODELE 3 — STRICT / WATCHLIST + DISCORD
+# MODELE 3 — STRICT / WATCHLIST + DISCORD (FIX RR)
 # =====================================================
 import streamlit as st
 import pandas as pd
@@ -102,7 +102,7 @@ def modele3(df):
         atr14.iloc[i] < atr40.iloc[i],          # compression
         c.iloc[i] > ema20.iloc[i],              # trend court
         c.iloc[i] > ema50.iloc[i],              # trend moyen
-        c.iloc[i] > range_high.iloc[i-1]        # breakout
+        c.iloc[i] > range_high.iloc[i - 1]      # breakout
     ])
 
     score_pct = round(score / 4 * 100, 2)
@@ -123,17 +123,13 @@ def modele3(df):
     if rr < MIN_RR:
         return None
 
-    return {
-        "Price": price,
-        "Score": score_pct,
-        "RR": rr
-    }
+    return {"Price": price, "Score": score_pct, "RR": rr}
 
 # ================= DISCORD =================
 def send_discord_modele3(df):
     lines = ["🚨 **MODÈLE 3 — SETUPS VALIDES**\n"]
 
-    for i, row in enumerate(df.itertuples(), 1):
+    for i, row in enumerate(df.itertuples(index=False), 1):
         lines.append(
             f"{i}️⃣ **{row.Ticker}** | "
             f"${row.Price} | "
@@ -143,10 +139,8 @@ def send_discord_modele3(df):
 
     lines.append("\n⏱ Scan Modèle 3 — Trading en Action")
 
-    payload = {"content": "\n".join(lines)}
-
     try:
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+        requests.post(DISCORD_WEBHOOK, json={"content": "\n".join(lines)}, timeout=5)
     except Exception:
         pass
 
@@ -166,18 +160,11 @@ if st.button("🚀 Scanner Modèle 3"):
         if not m:
             continue
 
-        rows.append([
-            t,
-            m["Price"],
-            m["Score"],
-            m["RR"]
-        ])
-
+        rows.append([t, m["Price"], m["Score"], m["RR"]])
         progress.progress((i + 1) / limit)
 
-    df_out = pd.DataFrame(
-        rows, columns=["Ticker", "Price", "Score", "R:R"]
-    )
+    # ✅ IMPORTANT: colonne = RR (pas R:R)
+    df_out = pd.DataFrame(rows, columns=["Ticker", "Price", "Score", "RR"])
 
     if df_out.empty:
         st.warning("Aucun setup Modèle 3 aujourd’hui.")
