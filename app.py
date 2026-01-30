@@ -1,5 +1,5 @@
 # =====================================================
-# MODELE 3 — STRICT / WATCHLIST + DISCORD (FIX RR)
+# MODELE 3 — STRICT / WATCHLIST + DISCORD (ROBUSTE)
 # =====================================================
 import streamlit as st
 import pandas as pd
@@ -17,10 +17,11 @@ DISCORD_WEBHOOK = st.secrets["DISCORD_WEBHOOK_URL"]
 LOOKBACK = 180
 MIN_SCORE = 65
 MIN_RR = 1.3
+MAX_DISCORD_LEN = 1900
 
 # ================= SESSION =================
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TradingEnAction-Modele3/1.0"})
+SESSION.headers.update({"User-Agent": "TradingEnAction-Modele3/1.1"})
 
 # ================= LOAD TICKERS =================
 @st.cache_data
@@ -78,12 +79,12 @@ def ATR(df, n):
     ], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-# ================= MODELE 3 LOGIC =================
+# ================= MODELE 3 =================
 def modele3(df):
     if len(df) < 80:
         return None
 
-    # ❗ on ignore la bougie du jour
+    # on ignore la bougie du jour
     df = df.iloc[:-1]
 
     c, h, l = df["Close"], df["High"], df["Low"]
@@ -99,14 +100,13 @@ def modele3(df):
     i = -1
 
     score = sum([
-        atr14.iloc[i] < atr40.iloc[i],          # compression
-        c.iloc[i] > ema20.iloc[i],              # trend court
-        c.iloc[i] > ema50.iloc[i],              # trend moyen
-        c.iloc[i] > range_high.iloc[i - 1]      # breakout
+        atr14.iloc[i] < atr40.iloc[i],
+        c.iloc[i] > ema20.iloc[i],
+        c.iloc[i] > ema50.iloc[i],
+        c.iloc[i] > range_high.iloc[i - 1]
     ])
 
     score_pct = round(score / 4 * 100, 2)
-
     if score_pct < MIN_SCORE:
         return None
 
@@ -119,7 +119,6 @@ def modele3(df):
         return None
 
     rr = round((tp - price) / (price - sl), 2)
-
     if rr < MIN_RR:
         return None
 
@@ -127,6 +126,14 @@ def modele3(df):
 
 # ================= DISCORD =================
 def send_discord_modele3(df):
+    if df.empty:
+        r = requests.post(
+            DISCORD_WEBHOOK,
+            json={"content": "ℹ️ **Modèle 3 — Aucun setup valide aujourd’hui**"},
+            timeout=10
+        )
+        return r.status_code == 204
+
     lines = ["🚨 **MODÈLE 3 — SETUPS VALIDES**\n"]
 
     for i, row in enumerate(df.itertuples(index=False), 1):
@@ -139,13 +146,29 @@ def send_discord_modele3(df):
 
     lines.append("\n⏱ Scan Modèle 3 — Trading en Action")
 
-    try:
-        requests.post(DISCORD_WEBHOOK, json={"content": "\n".join(lines)}, timeout=5)
-    except Exception:
-        pass
+    # split message si trop long
+    chunks = []
+    current = ""
+
+    for line in lines:
+        if len(current) + len(line) > MAX_DISCORD_LEN:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+
+    chunks.append(current)
+
+    for c in chunks:
+        r = requests.post(DISCORD_WEBHOOK, json={"content": c}, timeout=10)
+        if r.status_code != 204:
+            st.error(f"❌ Discord ERROR {r.status_code}: {r.text}")
+            return False
+        time.sleep(0.3)
+
+    return True
 
 # ================= UI =================
-limit = st.slider("Nombre de tickers", 50, len(TICKERS), 200)
+limit = st.slider("Nombre de tickers analysés", 50, len(TICKERS), 200)
 
 if st.button("🚀 Scanner Modèle 3"):
     rows = []
@@ -163,11 +186,15 @@ if st.button("🚀 Scanner Modèle 3"):
         rows.append([t, m["Price"], m["Score"], m["RR"]])
         progress.progress((i + 1) / limit)
 
-    # ✅ IMPORTANT: colonne = RR (pas R:R)
     df_out = pd.DataFrame(rows, columns=["Ticker", "Price", "Score", "RR"])
+
+    st.write("📊 Setups trouvés :", len(df_out))
 
     if df_out.empty:
         st.warning("Aucun setup Modèle 3 aujourd’hui.")
     else:
         st.dataframe(df_out, use_container_width=True)
-        send_discord_modele3(df_out)
+
+    if send_discord_modele3(df_out):
+        st.success("✅ Résultats envoyés sur Discord")
+
