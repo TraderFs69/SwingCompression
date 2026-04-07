@@ -1,28 +1,26 @@
 # =====================================================
-# MODELE 3 ELITE — TEA SCANNER (ULTRA RAPIDE)
+# TEA — MODELE 3 ELITE FINAL (EDGE + TOP 10)
 # =====================================================
 import streamlit as st
 import pandas as pd
 import requests
-import time
 from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= CONFIG =================
 st.set_page_config(layout="wide")
-st.title("🚨 TEA — MODELE 3 ELITE")
+st.title("🚨 TEA — MODELE 3 ELITE FINAL")
 
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 DISCORD_WEBHOOK = st.secrets["DISCORD_WEBHOOK_URL"]
 
 LOOKBACK = 160
-MIN_SCORE = 65
-TOP_N = 15
+TOP_N = 10
 MAX_WORKERS = 12
 
 SESSION = requests.Session()
 
-# ================= LOAD TICKERS =================
+# ================= LOAD UNIVERSE =================
 @st.cache_data
 def load_universe():
     df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
@@ -69,8 +67,8 @@ def ATR(df, n):
     ], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-# ================= SCORE ELITE =================
-def compute_score(df):
+# ================= SCORE + EDGE =================
+def compute_score_and_edge(df):
     if len(df) < 80:
         return None
 
@@ -92,48 +90,49 @@ def compute_score(df):
 
     i = -1
 
+    # ===== SCORE TECHNIQUE =====
     score = 0
 
-    # 🔥 TREND
     if c.iloc[i] > ema200.iloc[i]:
         score += 25
-
     if c.iloc[i] > ema50.iloc[i]:
         score += 15
-
     if c.iloc[i] > ema20.iloc[i]:
         score += 10
-
-    # 🔥 MOMENTUM
-    if c.iloc[i] > range_high.iloc[i-1]:
+    if c.iloc[i] > range_high.iloc[i - 1]:
         score += 20
-
-    # 🔥 VOLATILITY COMPRESSION
     if atr14.iloc[i] < atr40.iloc[i]:
         score += 10
-
-    # 🔥 VOLUME
     if rvol > 1.2:
         score += 10
-
-    # 🔥 TREND SLOPE
-    if ema20.iloc[i] > ema20.iloc[i-5]:
+    if ema20.iloc[i] > ema20.iloc[i - 5]:
         score += 10
 
-    return score
+    # ===== TRADE STRUCTURE =====
+    price = c.iloc[i]
 
-# ================= TRADE =================
-def build_trade(df):
-    c = df["Close"]
-    atr = ATR(df, 14)
+    sl = df["Low"].rolling(10).min().iloc[i]
+    tp = df["High"].rolling(30).max().iloc[i]
 
-    price = c.iloc[-2]
-    sl = price - atr.iloc[-2]
-    tp = price + 2 * atr.iloc[-2]
+    if price <= sl or tp <= price:
+        return None
 
     rr = (tp - price) / (price - sl)
 
-    return round(price,2), round(sl,2), round(tp,2), round(rr,2)
+    # ===== PROBABILITÉ =====
+    prob = 0.4 + (score / 100) * 0.5
+
+    # ===== EDGE =====
+    edge = (prob * rr) - (1 - prob)
+    final_score = round(edge * 100, 1)
+
+    return {
+        "Price": round(price, 2),
+        "Score": score,
+        "RR": round(rr, 2),
+        "Prob": round(prob, 2),
+        "Edge": final_score
+    }
 
 # ================= WORKER =================
 def process_row(row):
@@ -143,20 +142,17 @@ def process_row(row):
     if df is None:
         return None
 
-    score = compute_score(df)
-    if score is None or score < MIN_SCORE:
-        return None
-
-    price, sl, tp, rr = build_trade(df)
-
-    if rr < 1.3:
+    res = compute_score_and_edge(df)
+    if not res or res["Edge"] < 20:
         return None
 
     return {
         "Ticker": ticker,
-        "Price": price,
-        "Score": score,
-        "RR": rr,
+        "Price": res["Price"],
+        "Score": res["Score"],
+        "RR": res["RR"],
+        "Prob": res["Prob"],
+        "Edge": res["Edge"],
         "Sector": row["GICS Sector"],
         "Name": row["Security"]
     }
@@ -182,18 +178,22 @@ if st.button("🚀 Lancer Scan ELITE"):
     if df.empty:
         st.warning("Aucun setup trouvé.")
     else:
-        df = df.sort_values("Score", ascending=False).head(TOP_N)
+        # 🔥 TRI PAR EDGE
+        df = df.sort_values("Edge", ascending=False)
+
+        # 🔥 TOP 10
+        df = df.head(TOP_N)
+
         st.dataframe(df, use_container_width=True)
 
-# ================= DISCORD =================
-        msg = "🚨 **TEA ELITE — TOP SETUPS**\n\n"
+        # ================= DISCORD =================
+        msg = "🚨 **TEA ELITE — TOP 10 SETUPS**\n\n"
 
-        for i, row in df.iterrows():
+        for _, row in df.iterrows():
             msg += (
                 f"{row['Ticker']} | ${row['Price']} | "
-                f"Score {row['Score']} | R:R {row['RR']}\n"
+                f"Edge {row['Edge']} | R:R {row['RR']}\n"
                 f"{row['Sector']} — {row['Name']}\n\n"
             )
 
         requests.post(DISCORD_WEBHOOK, json={"content": msg})
-
