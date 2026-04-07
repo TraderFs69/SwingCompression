@@ -1,199 +1,154 @@
-# =====================================================
-# TEA — MODELE 3 ELITE FINAL (EDGE + TOP 10)
-# =====================================================
-import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
-from datetime import date, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+from datetime import datetime, timedelta
 
-# ================= CONFIG =================
-st.set_page_config(layout="wide")
-st.title("🚨 TEA — MODELE 3 ELITE FINAL")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
-DISCORD_WEBHOOK = st.secrets["DISCORD_WEBHOOK_URL"]
-
-LOOKBACK = 160
-TOP_N = 10
-MAX_WORKERS = 12
-
-SESSION = requests.Session()
-
-# ================= LOAD UNIVERSE =================
-@st.cache_data
+# =========================
+# LOAD UNIVERSE (SP500 FAST)
+# =========================
 def load_universe():
     df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
-    return df[["Symbol", "Security", "GICS Sector"]]
+    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
-UNIVERSE = load_universe()
-
-# ================= DATA =================
-def get_data(ticker):
+# =========================
+# FETCH DATA (POLYGON)
+# =========================
+def get_data(ticker, start, end):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
     try:
-        end = date.today()
-        start = end - timedelta(days=LOOKBACK)
-
-        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_KEY}"
-
-        r = SESSION.get(url, timeout=10)
-        if r.status_code != 200:
-            return None
-
+        r = requests.get(url, timeout=10)
         data = r.json()
         if "results" not in data:
             return None
 
         df = pd.DataFrame(data["results"])
-        df["Close"] = df["c"]
-        df["High"] = df["h"]
-        df["Low"] = df["l"]
-        df["Volume"] = df["v"]
+        df["Date"] = pd.to_datetime(df["t"], unit="ms")
+        df.set_index("Date", inplace=True)
 
-        return df
-
+        df.rename(columns={"c":"close","v":"volume"}, inplace=True)
+        return df[["close","volume"]]
     except:
         return None
 
-# ================= INDICATEURS =================
-def EMA(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+# =========================
+# INDICATORS
+# =========================
+def add_indicators(df):
+    df["ema20"] = df["close"].ewm(span=20).mean()
+    df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+    df["vol_avg"] = df["volume"].rolling(20).mean()
+    df["high_20"] = df["close"].rolling(20).max()
+    return df
 
-def ATR(df, n):
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift()).abs(),
-        (df["Low"] - df["Close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-# ================= SCORE + EDGE =================
-def compute_score_and_edge(df):
-    if len(df) < 80:
+# =========================
+# SCORING TEA CLEAN
+# =========================
+def analyze(df):
+    if len(df) < 220:
         return None
 
-    df = df.iloc[:-1]
+    df = add_indicators(df)
 
-    c = df["Close"]
+    last = df.iloc[-1]
 
-    ema20 = EMA(c, 20)
-    ema50 = EMA(c, 50)
-    ema200 = EMA(c, 200)
+    close = last["close"]
+    ema20 = last["ema20"]
+    ema50 = last["ema50"]
+    ema200 = last["ema200"]
+    volume = last["volume"]
+    vol_avg = last["vol_avg"]
+    high_20_prev = df["high_20"].iloc[-2]
 
-    atr14 = ATR(df, 14)
-    atr40 = ATR(df, 40)
+    # =========================
+    # FILTRES STRUCTURE (KILL ZONE)
+    # =========================
+    trend_ok = (close > ema50 > ema200)
+    if not trend_ok:
+        return None
 
-    vol = df["Volume"]
-    rvol = vol.iloc[-1] / vol.rolling(20).mean().iloc[-1]
+    if close < ema200:
+        return None
 
-    range_high = df["High"].rolling(10).max()
+    # =========================
+    # BREAKOUT RÉEL
+    # =========================
+    breakout = close > high_20_prev
 
-    i = -1
+    # =========================
+    # VOLUME CONFIRMATION
+    # =========================
+    volume_ok = volume > vol_avg * 1.5
 
-    # ===== SCORE TECHNIQUE =====
+    # =========================
+    # RR (NE PAS ÊTRE TROP ÉTIRÉ)
+    # =========================
+    rr_ok = close / ema20 < 1.08
+
+    # =========================
+    # SCORE EDGE TEA
+    # =========================
     score = 0
+    if trend_ok: score += 30
+    if breakout: score += 25
+    if volume_ok: score += 20
+    if rr_ok: score += 15
 
-    if c.iloc[i] > ema200.iloc[i]:
-        score += 25
-    if c.iloc[i] > ema50.iloc[i]:
-        score += 15
-    if c.iloc[i] > ema20.iloc[i]:
-        score += 10
-    if c.iloc[i] > range_high.iloc[i - 1]:
-        score += 20
-    if atr14.iloc[i] < atr40.iloc[i]:
-        score += 10
-    if rvol > 1.2:
-        score += 10
-    if ema20.iloc[i] > ema20.iloc[i - 5]:
-        score += 10
-
-    # ===== TRADE STRUCTURE =====
-    price = c.iloc[i]
-
-    sl = df["Low"].rolling(10).min().iloc[i]
-    tp = df["High"].rolling(30).max().iloc[i]
-
-    if price <= sl or tp <= price:
-        return None
-
-    rr = (tp - price) / (price - sl)
-
-    # ===== PROBABILITÉ =====
-    prob = 0.4 + (score / 100) * 0.5
-
-    # ===== EDGE =====
-    edge = (prob * rr) - (1 - prob)
-    final_score = round(edge * 100, 1)
-
-    return {
-        "Price": round(price, 2),
-        "Score": score,
-        "RR": round(rr, 2),
-        "Prob": round(prob, 2),
-        "Edge": final_score
-    }
-
-# ================= WORKER =================
-def process_row(row):
-    ticker = row["Symbol"]
-
-    df = get_data(ticker)
-    if df is None:
-        return None
-
-    res = compute_score_and_edge(df)
-    if not res or res["Edge"] < 20:
+    # =========================
+    # FILTRE FINAL
+    # =========================
+    if score < 70:
         return None
 
     return {
-        "Ticker": ticker,
-        "Price": res["Price"],
-        "Score": res["Score"],
-        "RR": res["RR"],
-        "Prob": res["Prob"],
-        "Edge": res["Edge"],
-        "Sector": row["GICS Sector"],
-        "Name": row["Security"]
+        "close": round(close,2),
+        "score": score,
+        "volume_ratio": round(volume / vol_avg,2)
     }
 
-# ================= SCAN =================
-if st.button("🚀 Lancer Scan ELITE"):
+# =========================
+# DISCORD
+# =========================
+def send_discord(results):
+    if not results:
+        msg = "⚠️ Aucun breakout valide aujourd’hui (marché faible ou extension)"
+    else:
+        msg = "🟫 TEA SCANNER — BREAKOUTS PROPRES\n\n"
+
+        for r in results:
+            msg += f"{r['ticker']} | {r['close']}$ | Score {r['score']} | Vol x{r['volume_ratio']}\n"
+
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+
+# =========================
+# MAIN
+# =========================
+def main():
+    tickers = load_universe()
+
+    end = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=300)).strftime("%Y-%m-%d")
 
     results = []
-    progress = st.progress(0)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_row, row) for _, row in UNIVERSE.iterrows()]
+    for ticker in tickers:
+        df = get_data(ticker, start, end)
+        if df is None:
+            continue
 
-        for i, future in enumerate(as_completed(futures)):
-            res = future.result()
-            if res:
-                results.append(res)
+        res = analyze(df)
+        if res:
+            res["ticker"] = ticker
+            results.append(res)
 
-            progress.progress((i + 1) / len(UNIVERSE))
+    # TRI
+    results = sorted(results, key=lambda x: x["score"], reverse=True)[:15]
 
-    df = pd.DataFrame(results)
+    send_discord(results)
 
-    if df.empty:
-        st.warning("Aucun setup trouvé.")
-    else:
-        # 🔥 TRI PAR EDGE
-        df = df.sort_values("Edge", ascending=False)
-
-        # 🔥 TOP 10
-        df = df.head(TOP_N)
-
-        st.dataframe(df, use_container_width=True)
-
-        # ================= DISCORD =================
-        msg = "🚨 **TEA ELITE — TOP 10 SETUPS**\n\n"
-
-        for _, row in df.iterrows():
-            msg += (
-                f"{row['Ticker']} | ${row['Price']} | "
-                f"Edge {row['Edge']} | R:R {row['RR']}\n"
-                f"{row['Sector']} — {row['Name']}\n\n"
-            )
-
-        requests.post(DISCORD_WEBHOOK, json={"content": msg})
+if __name__ == "__main__":
+    main()
