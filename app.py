@@ -2,24 +2,25 @@ import pandas as pd
 import requests
 import os
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # =========================
-# LOAD UNIVERSE (SP500 FAST)
+# LOAD RUSSELL (LOCAL FILE)
 # =========================
 def load_universe():
-    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
-    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    df = pd.read_excel("russell3000_constituents.xlsx")
+    return df[["Symbol", "Sector"]].dropna()
 
 # =========================
-# FETCH DATA (POLYGON)
+# FETCH DATA
 # =========================
 def get_data(ticker, start, end):
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=5)
         data = r.json()
         if "results" not in data:
             return None
@@ -28,7 +29,6 @@ def get_data(ticker, start, end):
         df["Date"] = pd.to_datetime(df["t"], unit="ms")
         df.set_index("Date", inplace=True)
 
-        # 🔥 IMPORTANT : on ajoute HIGH
         df.rename(columns={
             "c": "close",
             "h": "high",
@@ -41,24 +41,23 @@ def get_data(ticker, start, end):
         return None
 
 # =========================
-# INDICATORS
+# ANALYSE RAPIDE
 # =========================
-def add_indicators(df):
+def analyze_stock(row, start, end):
+    ticker = row["Symbol"]
+    sector = row["Sector"]
+
+    df = get_data(ticker, start, end)
+    if df is None or len(df) < 220:
+        return None
+
+    # INDICATEURS
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
     df["ema200"] = df["close"].ewm(span=200).mean()
     df["vol_avg"] = df["volume"].rolling(20).mean()
     df["high_20"] = df["high"].rolling(20).max()
-    return df
 
-# =========================
-# ANALYSE BREAKOUT
-# =========================
-def analyze(df):
-    if len(df) < 220:
-        return None
-
-    df = add_indicators(df)
     last = df.iloc[-1]
 
     close = last["close"]
@@ -69,38 +68,26 @@ def analyze(df):
     volume = last["volume"]
     vol_avg = last["vol_avg"]
 
-    high_20_prev = df["high_20"].iloc[-2]
-    high_5_prev = df["high"].rolling(5).max().iloc[-2]
+    # =========================
+    # PRÉ-FILTRE (ULTRA IMPORTANT)
+    # =========================
+    if close < ema200:
+        return None
 
-    # =========================
-    # 1. TREND (OBLIGATOIRE)
-    # =========================
-    if not (close > ema50 > ema200):
+    if volume < 500000:
         return None
 
     # =========================
-    # 2. BREAKOUT INTRADAY
+    # BREAKOUT LOGIC
     # =========================
+    high_20_prev = df["high_20"].iloc[-2]
+    high_5_prev = df["high"].rolling(5).max().iloc[-2]
+
     breakout = high >= high_20_prev * 0.99
-
-    # =========================
-    # 3. EARLY BREAKOUT
-    # =========================
     early = high >= high_5_prev * 0.99
-
-    # =========================
-    # 4. MOMENTUM
-    # =========================
     momentum = close > df["close"].iloc[-5]
 
-    # =========================
-    # 5. VOLUME (ASSOUPLI)
-    # =========================
     volume_ok = volume > vol_avg * 1.1
-
-    # =========================
-    # 6. EXTENSION
-    # =========================
     not_extended = close / ema20 < 1.20
 
     # =========================
@@ -108,11 +95,12 @@ def analyze(df):
     # =========================
     score = 0
 
-    if breakout: score += 30
-    if early: score += 20
-    if momentum: score += 20
-    if volume_ok: score += 15
-    if not_extended: score += 15
+    if close > ema50 > ema200: score += 25
+    if breakout: score += 25
+    if early: score += 15
+    if momentum: score += 15
+    if volume_ok: score += 10
+    if not_extended: score += 10
 
     if score < 60:
         return None
@@ -124,51 +112,64 @@ def analyze(df):
     )
 
     return {
+        "ticker": ticker,
+        "sector": sector,
         "close": round(close, 2),
         "score": score,
-        "volume_ratio": round(volume / vol_avg, 2),
-        "type": setup_type
+        "type": setup_type,
+        "volume_ratio": round(volume / vol_avg, 2)
     }
 
 # =========================
-# DISCORD
-# =========================
-def send_discord(results):
-    if not results:
-        msg = "⚠️ Aucun setup valide aujourd’hui"
-    else:
-        msg = "🟫 TEA SCANNER\n\n"
-
-        for r in results:
-            msg += f"{r['ticker']} | {r['type']} | {r['close']}$ | Score {r['score']} | Vol x{r['volume_ratio']}\n"
-
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
-
-# =========================
-# MAIN
+# MAIN MULTI-THREAD
 # =========================
 def main():
-    tickers = load_universe()
+    universe = load_universe()
 
     end = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=300)).strftime("%Y-%m-%d")
 
     results = []
 
-    for ticker in tickers:
-        df = get_data(ticker, start, end)
-        if df is None:
-            continue
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(analyze_stock, row, start, end)
+            for _, row in universe.iterrows()
+        ]
 
-        res = analyze(df)
-        if res:
-            res["ticker"] = ticker
-            results.append(res)
+        for f in futures:
+            res = f.result()
+            if res:
+                results.append(res)
 
-    # TRI FINAL
-    results = sorted(results, key=lambda x: x["score"], reverse=True)[:15]
+    # =========================
+    # TRI
+    # =========================
+    results = sorted(results, key=lambda x: x["score"], reverse=True)[:20]
 
-    send_discord(results)
+    # =========================
+    # SECTEURS DOMINANTS
+    # =========================
+    sector_count = pd.Series([r["sector"] for r in results]).value_counts()
+
+    # =========================
+    # DISCORD MESSAGE
+    # =========================
+    if not results:
+        msg = "⚠️ Aucun setup valide aujourd’hui"
+    else:
+        msg = "🟫 TEA SCANNER — RUSSELL\n\n"
+
+        msg += "🏭 Secteurs dominants:\n"
+        for s, count in sector_count.head(3).items():
+            msg += f"{s} ({count})\n"
+
+        msg += "\n🎯 Top setups:\n\n"
+
+        for r in results:
+            msg += f"{r['ticker']} | {r['sector']} | {r['type']} | {r['close']}$ | Score {r['score']} | Vol x{r['volume_ratio']}\n"
+
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
 if __name__ == "__main__":
     main()
