@@ -63,60 +63,62 @@ def analyze(df):
     volume = last["volume"]
     vol_avg = last["vol_avg"]
 
-    high_20_prev = df["high_20"].iloc[-2]
-    low_20_prev = df["low_20"].iloc[-2]
+    high_20 = df["high_20"].iloc[-2]
+    high_5 = df["close"].rolling(5).max().iloc[-2]
 
     # =========================
-    # 1. TREND FILTER
+    # TREND (NON NÉGOCIABLE)
     # =========================
     if not (close > ema50 > ema200):
         return None
 
     # =========================
-    # 2. COMPRESSION (KEY)
+    # TYPES DE SETUPS
     # =========================
-    range_pct = (high_20_prev - low_20_prev) / low_20_prev
-    compression = range_pct < 0.25  # range serré
 
-    if not compression:
+    # 1. BREAKOUT PUR
+    breakout = close >= high_20 * 0.98
+
+    # 2. EARLY BREAKOUT (PRESSION)
+    early = close >= high_5 * 0.98
+
+    # 3. MOMENTUM LEADER
+    momentum = close > ema20 and close > df["close"].iloc[-5]
+
+    # =========================
+    # VOLUME (ASSOUPLI)
+    # =========================
+    volume_ok = volume > vol_avg * 1.1
+
+    # =========================
+    # EXTENSION
+    # =========================
+    not_extended = close / ema20 < 1.20
+
+    # =========================
+    # SCORE
+    # =========================
+    score = 0
+
+    if breakout: score += 30
+    if early: score += 20
+    if momentum: score += 20
+    if volume_ok: score += 15
+    if not_extended: score += 15
+
+    if score < 60:
         return None
 
-    # =========================
-    # 3. BREAKOUT (REALISTIC)
-    # =========================
-    breakout = close >= high_20_prev * 0.98
-
-    # =========================
-    # 4. VOLUME CONFIRMATION
-    # =========================
-    volume_ok = volume > vol_avg * 1.2
-
-    # =========================
-    # 5. EXTENSION CONTROL
-    # =========================
-    not_extended = close / ema20 < 1.15
-
-    # =========================
-    # FINAL DECISION
-    # =========================
-    if breakout and volume_ok and not_extended:
-        score = 0
-
-        score += 30  # trend
-        score += 25  # breakout
-        score += 20  # volume
-        score += 15  # compression
-        score += 10  # rr
-
-        return {
-            "close": round(close,2),
-            "score": score,
-            "volume_ratio": round(volume / vol_avg,2),
-            "range_pct": round(range_pct,2)
-        }
-
-    return None
-
+    return {
+        "close": round(close,2),
+        "score": score,
+        "volume_ratio": round(volume / vol_avg,2),
+        "type": (
+            "BREAKOUT" if breakout else
+            "EARLY" if early else
+            "MOMENTUM"
+        )
+    }
 # =========================
 # DISCORD OUTPUT
 # =========================
