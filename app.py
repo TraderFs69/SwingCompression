@@ -1,6 +1,7 @@
 import pandas as pd
 import requests
 import os
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,123 +9,130 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # =========================
-# LOAD RUSSELL (LOCAL FILE)
+# LOAD UNIVERSE (ANTI BUG)
 # =========================
 def load_universe():
-    df = pd.read_excel("russell3000_constituents.xlsx")
-    return df[["Symbol", "Sector"]].dropna()
-
-# =========================
-# FETCH DATA
-# =========================
-def get_data(ticker, start, end):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
     try:
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        if "results" not in data:
-            return None
-
-        df = pd.DataFrame(data["results"])
-        df["Date"] = pd.to_datetime(df["t"], unit="ms")
-        df.set_index("Date", inplace=True)
-
-        df.rename(columns={
-            "c": "close",
-            "h": "high",
-            "v": "volume"
-        }, inplace=True)
-
-        return df[["close", "high", "volume"]]
-
+        url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
+        df = pd.read_csv(url)
+        df["Sector"] = "Unknown"
+        print(f"Universe loaded: {len(df)} stocks")
+        return df[["Symbol", "Sector"]]
     except:
-        return None
+        print("ERROR loading universe")
+        return pd.DataFrame(columns=["Symbol", "Sector"])
 
 # =========================
-# ANALYSE RAPIDE
+# FETCH DATA (RETRY)
+# =========================
+def get_data(ticker, start, end, retries=2):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
+
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=5)
+            data = r.json()
+
+            if "results" not in data:
+                return None
+
+            df = pd.DataFrame(data["results"])
+            df["Date"] = pd.to_datetime(df["t"], unit="ms")
+            df.set_index("Date", inplace=True)
+
+            df.rename(columns={
+                "c": "close",
+                "h": "high",
+                "v": "volume"
+            }, inplace=True)
+
+            return df[["close", "high", "volume"]]
+
+        except:
+            time.sleep(1)
+
+    return None
+
+# =========================
+# ANALYSE
 # =========================
 def analyze_stock(row, start, end):
     ticker = row["Symbol"]
     sector = row["Sector"]
 
     df = get_data(ticker, start, end)
-    if df is None or len(df) < 220:
+    if df is None or len(df) < 200:
         return None
 
-    # INDICATEURS
-    df["ema20"] = df["close"].ewm(span=20).mean()
-    df["ema50"] = df["close"].ewm(span=50).mean()
-    df["ema200"] = df["close"].ewm(span=200).mean()
-    df["vol_avg"] = df["volume"].rolling(20).mean()
-    df["high_20"] = df["high"].rolling(20).max()
+    try:
+        df["ema20"] = df["close"].ewm(span=20).mean()
+        df["ema50"] = df["close"].ewm(span=50).mean()
+        df["ema200"] = df["close"].ewm(span=200).mean()
+        df["vol_avg"] = df["volume"].rolling(20).mean()
+        df["high_20"] = df["high"].rolling(20).max()
 
-    last = df.iloc[-1]
+        last = df.iloc[-1]
 
-    close = last["close"]
-    high = last["high"]
-    ema20 = last["ema20"]
-    ema50 = last["ema50"]
-    ema200 = last["ema200"]
-    volume = last["volume"]
-    vol_avg = last["vol_avg"]
+        close = last["close"]
+        high = last["high"]
+        ema20 = last["ema20"]
+        ema50 = last["ema50"]
+        ema200 = last["ema200"]
+        volume = last["volume"]
+        vol_avg = last["vol_avg"]
 
-    # =========================
-    # PRÉ-FILTRE (ULTRA IMPORTANT)
-    # =========================
-    if close < ema200:
+        # PRÉ-FILTRE
+        if close < ema200 or volume < 300000:
+            return None
+
+        high_20_prev = df["high_20"].iloc[-2]
+        high_5_prev = df["high"].rolling(5).max().iloc[-2]
+
+        breakout = high >= high_20_prev * 0.99
+        early = high >= high_5_prev * 0.99
+        momentum = close > df["close"].iloc[-5]
+
+        volume_ok = volume > vol_avg * 1.05
+        not_extended = close / ema20 < 1.25
+
+        score = 0
+        if close > ema50 > ema200: score += 25
+        if breakout: score += 25
+        if early: score += 15
+        if momentum: score += 15
+        if volume_ok: score += 10
+        if not_extended: score += 10
+
+        if score < 50:
+            return None
+
+        return {
+            "ticker": ticker,
+            "sector": sector,
+            "close": round(close, 2),
+            "score": score,
+            "type": (
+                "BREAKOUT" if breakout else
+                "EARLY" if early else
+                "MOMENTUM"
+            ),
+            "volume_ratio": round(volume / vol_avg, 2)
+        }
+
+    except:
         return None
-
-    if volume < 500000:
-        return None
-
-    # =========================
-    # BREAKOUT LOGIC
-    # =========================
-    high_20_prev = df["high_20"].iloc[-2]
-    high_5_prev = df["high"].rolling(5).max().iloc[-2]
-
-    breakout = high >= high_20_prev * 0.99
-    early = high >= high_5_prev * 0.99
-    momentum = close > df["close"].iloc[-5]
-
-    volume_ok = volume > vol_avg * 1.1
-    not_extended = close / ema20 < 1.20
-
-    # =========================
-    # SCORE
-    # =========================
-    score = 0
-
-    if close > ema50 > ema200: score += 25
-    if breakout: score += 25
-    if early: score += 15
-    if momentum: score += 15
-    if volume_ok: score += 10
-    if not_extended: score += 10
-
-    if score < 60:
-        return None
-
-    setup_type = (
-        "BREAKOUT" if breakout else
-        "EARLY" if early else
-        "MOMENTUM"
-    )
-
-    return {
-        "ticker": ticker,
-        "sector": sector,
-        "close": round(close, 2),
-        "score": score,
-        "type": setup_type,
-        "volume_ratio": round(volume / vol_avg, 2)
-    }
 
 # =========================
-# MAIN MULTI-THREAD
+# MAIN
 # =========================
 def main():
+    print("Starting TEA scanner...")
+
     universe = load_universe()
+
+    if universe.empty:
+        print("Universe empty — STOP")
+        return
 
     end = datetime.today().strftime("%Y-%m-%d")
     start = (datetime.today() - timedelta(days=300)).strftime("%Y-%m-%d")
@@ -142,23 +150,32 @@ def main():
             if res:
                 results.append(res)
 
-    # =========================
-    # TRI
-    # =========================
-    results = sorted(results, key=lambda x: x["score"], reverse=True)[:20]
+    print(f"Valid setups found: {len(results)}")
 
     # =========================
-    # SECTEURS DOMINANTS
-    # =========================
-    sector_count = pd.Series([r["sector"] for r in results]).value_counts()
-
-    # =========================
-    # DISCORD MESSAGE
+    # FALLBACK SI 0
     # =========================
     if not results:
-        msg = "⚠️ Aucun setup valide aujourd’hui"
+        print("No setups — fallback momentum")
+
+        fallback = []
+        for _, row in universe.head(50).iterrows():
+            df = get_data(row["Symbol"], start, end)
+            if df is None or len(df) < 50:
+                continue
+
+            if df["close"].iloc[-1] > df["close"].iloc[-5]:
+                fallback.append(row["Symbol"])
+
+        msg = "⚠️ Aucun breakout — marché faible\n\n🔥 Momentum fallback:\n"
+        msg += "\n".join(fallback[:10])
+
     else:
-        msg = "🟫 TEA SCANNER — RUSSELL\n\n"
+        results = sorted(results, key=lambda x: x["score"], reverse=True)[:15]
+
+        sector_count = pd.Series([r["sector"] for r in results]).value_counts()
+
+        msg = "🟫 TEA SCANNER\n\n"
 
         msg += "🏭 Secteurs dominants:\n"
         for s, count in sector_count.head(3).items():
@@ -169,7 +186,17 @@ def main():
         for r in results:
             msg += f"{r['ticker']} | {r['sector']} | {r['type']} | {r['close']}$ | Score {r['score']} | Vol x{r['volume_ratio']}\n"
 
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+    # =========================
+    # DISCORD SAFE
+    # =========================
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        print("Sent to Discord")
+    except:
+        print("Discord failed")
 
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
     main()
