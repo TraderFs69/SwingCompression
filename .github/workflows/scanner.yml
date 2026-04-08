@@ -2,7 +2,7 @@ name: TEA Scanner
 
 on:
   schedule:
-    - cron: '15 0 * * 2-6'  # 20h15 EST = 00h15 UTC (mardi à samedi)
+    - cron: '10 0 * * 2-6'  # légèrement avant pour compenser delay
   workflow_dispatch:
 
 jobs:
@@ -12,6 +12,9 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
+
+      - name: Debug time
+        run: date
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -27,4 +30,6 @@ jobs:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
+          echo "START BOT"
           python bot.py
+          echo "END BOT"
