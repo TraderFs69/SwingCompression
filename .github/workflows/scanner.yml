@@ -2,7 +2,7 @@ name: TEA Scanner
 
 on:
   schedule:
-    - cron: '10 0 * * 2-6'  # légèrement avant pour compenser delay
+    - cron: '45 1 * * 2-6'  # légèrement avant pour compenser delay
   workflow_dispatch:
 
 jobs:
