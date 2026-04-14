@@ -2,7 +2,8 @@ name: TEA Scanner
 
 on:
   schedule:
-    - cron: '45 1 * * 2-6'  # légèrement avant pour compenser delay
+    - cron: '0 0 * * *'  # 20h Québec = 00h UTC
+    - cron: '0 23 * * *'  # ~20h Québec
   workflow_dispatch:
 
 jobs:
