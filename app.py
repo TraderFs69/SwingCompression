@@ -11,17 +11,18 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # =========================
 # LOAD UNIVERSE (ANTI BUG)
 # =========================
-def load_universe():
-    try:
-        url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
-        df = pd.read_csv(url)
-        df["Sector"] = "Unknown"
-        print(f"Universe loaded: {len(df)} stocks")
-        return df[["Symbol", "Sector"]]
-    except:
-        print("ERROR loading universe")
-        return pd.DataFrame(columns=["Symbol", "Sector"])
+import pandas as pd
 
+def load_sp500():
+    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+
+    try:
+        df = pd.read_csv(url)
+        return df["Symbol"].tolist()
+
+    except Exception as e:
+        print("Erreur chargement S&P500:", e)
+        return []
 # =========================
 # FETCH DATA (RETRY)
 # =========================
