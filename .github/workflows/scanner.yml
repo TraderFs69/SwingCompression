@@ -44,12 +44,18 @@ jobs:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python -c "
-import os
+          echo "Checking secrets..."
+          if [ -z "$POLYGON_API_KEY" ]; then
+            echo "POLYGON_API_KEY is missing"
+          else
+            echo "POLYGON_API_KEY exists"
+          fi
 
-print('POLYGON_API_KEY exists:', bool(os.getenv('POLYGON_API_KEY')))
-print('DISCORD_WEBHOOK_URL exists:', bool(os.getenv('DISCORD_WEBHOOK_URL')))
-"
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is missing"
+          else
+            echo "DISCORD_WEBHOOK_URL exists"
+          fi
 
       - name: Run scanner
         env:
